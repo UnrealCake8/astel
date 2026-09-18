@@ -97,6 +97,9 @@ int main(){
   ep.audDevManager().setNullDev();
 
   AccountConfig ac; ac.idUri="sip:"+user+"@sip.callcentric.net"; ac.regConfig.registrarUri="sip:sip.callcentric.net";
+  // Registration must use the TCP transport we created above. Without this,
+  // PJSUA2 may try the default UDP transport, which this daemon does not create.
+  ac.sipConfig.proxies.push_back("sip:sip.callcentric.net;transport=tcp");
   AuthCredInfo cred("digest","sip.callcentric.net",user,0,pass); ac.sipConfig.authCreds.push_back(cred);
   account.create(ac);
 
