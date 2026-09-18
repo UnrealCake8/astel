@@ -79,26 +79,48 @@ public:
     std::thread([self]{
       try { ep.libRegisterThread("astel-stt"); } catch(...) {}
       size_t processed=0;
+      unsigned long chunkNo=0;
       while(!self->stopTranscription.load()){
-        std::this_thread::sleep_for(std::chrono::seconds(4));
+        // Smaller windows make incoming speech appear much sooner in the UI.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
         std::string src; { std::lock_guard<std::mutex> l(self->mu); src=self->recordPath; }
         if(src.empty()) continue;
-        std::string chunk="/tmp/astel-whisper-"+std::to_string(self->getId())+".wav";
-        std::string out="/tmp/astel-whisper-"+std::to_string(self->getId());
-        std::string ff="ffmpeg -loglevel error -y -i "+shellQuote(src)+" -ss "+std::to_string(processed)+" -t 5 -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
-        if(std::system(ff.c_str())!=0) continue;
-        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -otxt -of "+shellQuote(out)+" --prompt "+shellQuote("Asanib phone call. Astel is the internal codename.")+" >/dev/null 2>&1";
+
+        const std::string base="/tmp/astel-whisper-"+std::to_string(self->getId())+"-"+std::to_string(chunkNo++);
+        const std::string chunk=base+".wav";
+        // Read a 3-second window every 2 seconds (1 second overlap). Copying the
+        // live recorder file first avoids ffmpeg racing a WAV header being updated.
+        const std::string snap=base+"-source.wav";
+        std::string cp="cp "+shellQuote(src)+" "+shellQuote(snap);
+        if(std::system(cp.c_str())!=0) continue;
+        std::string ff="ffmpeg -loglevel error -y -ss "+std::to_string(processed)+" -i "+shellQuote(snap)+" -t 3 -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
+        if(std::system(ff.c_str())!=0){ std::remove(snap.c_str()); continue; }
+
+        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -nt -otxt -of "+shellQuote(base)+" >/dev/null 2>&1";
         if(std::system(wc.c_str())==0){
-          std::ifstream in(out+".txt"); std::string line, all;
+          std::ifstream in(base+".txt"); std::string line, all;
           while(std::getline(in,line)){ if(!all.empty()) all+=" "; all+=line; }
           while(!all.empty() && std::isspace((unsigned char)all.front())) all.erase(all.begin());
           while(!all.empty() && std::isspace((unsigned char)all.back())) all.pop_back();
-          if(!all.empty()){
+
+          // whisper.cpp emits these for silence; they are not useful transcript.
+          std::string lowered=all;
+          for(char& ch:lowered) ch=(char)std::tolower((unsigned char)ch);
+          bool blank=lowered.empty() || lowered=="[blank_audio]" || lowered=="[blank audio]" ||
+                     lowered=="[silence]" || lowered=="(silence)" || lowered=="[music]";
+
+          if(!blank){
             std::lock_guard<std::mutex> l(self->mu);
-            if(self->transcript.empty() || self->transcript.back()!=all) self->transcript.push_back(all);
+            if(self->transcript.empty() || self->transcript.back()!=all){
+              self->transcript.push_back(all);
+              std::cout<<"STT "<<self->getId()<<": "<<all<<"\\n";
+            }
           }
         }
-        processed+=4;
+        std::remove(snap.c_str());
+        std::remove(chunk.c_str());
+        std::remove((base+".txt").c_str());
+        processed+=2;
       }
       self->transcribing=false;
     }).detach();
