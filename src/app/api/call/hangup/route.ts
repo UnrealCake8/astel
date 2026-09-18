@@ -1,0 +1,1 @@
+import {NextRequest} from "next/server";import {proxy} from "../_daemon";export const runtime="nodejs";export async function POST(req:NextRequest){const {id}=await req.json();const r=await proxy("/calls/"+encodeURIComponent(id),{method:"DELETE"});return new Response(await r.text(),{status:r.status,headers:{"Content-Type":"application/json"}})}
