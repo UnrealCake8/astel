@@ -80,31 +80,22 @@ public:
       try { ep.libRegisterThread("astel-stt"); } catch(...) {}
       unsigned long chunkNo=0;
       while(!self->stopTranscription.load()){
-        // PJSIP keeps the WAV header unfinished while AudioMediaRecorder is
-        // recording, so ffmpeg cannot reliably seek/read the live file.
-        // Snapshot it, then repair the RIFF/data sizes from the bytes already
-        // written before handing the snapshot to ffmpeg/Whisper.
         std::this_thread::sleep_for(std::chrono::seconds(3));
         std::string src; { std::lock_guard<std::mutex> l(self->mu); src=self->recordPath; }
         if(src.empty()) continue;
 
         const std::string base="/tmp/astel-whisper-"+std::to_string(self->getId())+"-"+std::to_string(chunkNo++);
-        const std::string snap=base+"-source.wav";
         const std::string chunk=base+".wav";
-        std::string py="python3 -c "+shellQuote(
-          "import sys,struct,shutil,os; s,d=sys.argv[1:3]; shutil.copyfile(s,d); "
-          "n=os.path.getsize(d); f=open(d,'r+b'); "
-          "f.seek(4); f.write(struct.pack('<I',max(0,n-8))); "
-          "f.seek(40); f.write(struct.pack('<I',max(0,n-44))); f.close()"
-        )+" "+shellQuote(src)+" "+shellQuote(snap);
-        if(std::system(py.c_str())!=0) continue;
 
-        // Only transcribe the newest few seconds. This avoids re-running
-        // Whisper over the entire call and keeps latency bounded.
-        std::string ff="ffmpeg -loglevel error -y -sseof -4 -i "+shellQuote(snap)+" -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
+        // PJSIP's recorder WAV is intentionally unfinished while the call is
+        // active. ffmpeg can recover the live PCM stream and write a normal,
+        // finalized WAV for Whisper. Keep only the newest four seconds.
+        std::string ff="ffmpeg -loglevel error -y -sseof -4 -i "+shellQuote(src)+
+                       " -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
         if(std::system(ff.c_str())!=0){
           std::cerr<<"STT ffmpeg failed for call "<<self->getId()<<"\\n";
-          std::remove(snap.c_str()); continue;
+          std::remove(chunk.c_str());
+          continue;
         }
 
         std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -otxt -of "+shellQuote(base)+" >/dev/null 2>&1";
@@ -128,7 +119,9 @@ public:
         } else {
           std::cerr<<"STT whisper failed for call "<<self->getId()<<" (exit "<<wr<<")\\n";
         }
-        std::remove(snap.c_str());
+
+        // These are scratch files only. Delete each chunk immediately so STT
+        // does not accumulate storage during a call.
         std::remove(chunk.c_str());
         std::remove((base+".txt").c_str());
       }
