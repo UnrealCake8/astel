@@ -130,7 +130,7 @@ public:
   }
   std::string getTranscriptJson(){
     std::lock_guard<std::mutex> l(mu); std::string j="[";
-    for(size_t i=0;i<transcript.size();++i){ if(i) j+=","; j+="{\\\"speaker\\\":\\\"remote\\\",\\\"text\\\":\\\""+jsonStr(transcript[i])+"\\\"}"; }
+    for(size_t i=0;i<transcript.size();++i){ if(i) j+=","; j+="{\"speaker\":\"remote\",\"text\":\""+jsonStr(transcript[i])+"\"}"; }
     return j+"]";
   }
   std::string getState(){ std::lock_guard<std::mutex> l(mu); return state; }
