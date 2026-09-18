@@ -78,37 +78,46 @@ public:
     auto self=this;
     std::thread([self]{
       try { ep.libRegisterThread("astel-stt"); } catch(...) {}
-      size_t processed=0;
       unsigned long chunkNo=0;
       while(!self->stopTranscription.load()){
-        // Smaller windows make incoming speech appear much sooner in the UI.
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // PJSIP keeps the WAV header unfinished while AudioMediaRecorder is
+        // recording, so ffmpeg cannot reliably seek/read the live file.
+        // Snapshot it, then repair the RIFF/data sizes from the bytes already
+        // written before handing the snapshot to ffmpeg/Whisper.
+        std::this_thread::sleep_for(std::chrono::seconds(3));
         std::string src; { std::lock_guard<std::mutex> l(self->mu); src=self->recordPath; }
         if(src.empty()) continue;
 
         const std::string base="/tmp/astel-whisper-"+std::to_string(self->getId())+"-"+std::to_string(chunkNo++);
-        const std::string chunk=base+".wav";
-        // Read a 3-second window every 2 seconds (1 second overlap). Copying the
-        // live recorder file first avoids ffmpeg racing a WAV header being updated.
         const std::string snap=base+"-source.wav";
-        std::string cp="cp "+shellQuote(src)+" "+shellQuote(snap);
-        if(std::system(cp.c_str())!=0) continue;
-        std::string ff="ffmpeg -loglevel error -y -ss "+std::to_string(processed)+" -i "+shellQuote(snap)+" -t 3 -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
-        if(std::system(ff.c_str())!=0){ std::remove(snap.c_str()); continue; }
+        const std::string chunk=base+".wav";
+        std::string py="python3 -c "+shellQuote(
+          "import sys,struct,shutil,os; s,d=sys.argv[1:3]; shutil.copyfile(s,d); "
+          "n=os.path.getsize(d); f=open(d,'r+b'); "
+          "f.seek(4); f.write(struct.pack('<I',max(0,n-8))); "
+          "f.seek(40); f.write(struct.pack('<I',max(0,n-44))); f.close()"
+        )+" "+shellQuote(src)+" "+shellQuote(snap);
+        if(std::system(py.c_str())!=0) continue;
 
-        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -nt -otxt -of "+shellQuote(base)+" >/dev/null 2>&1";
-        if(std::system(wc.c_str())==0){
+        // Only transcribe the newest few seconds. This avoids re-running
+        // Whisper over the entire call and keeps latency bounded.
+        std::string ff="ffmpeg -loglevel error -y -sseof -4 -i "+shellQuote(snap)+" -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
+        if(std::system(ff.c_str())!=0){
+          std::cerr<<"STT ffmpeg failed for call "<<self->getId()<<"\\n";
+          std::remove(snap.c_str()); continue;
+        }
+
+        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -otxt -of "+shellQuote(base)+" >/dev/null 2>&1";
+        int wr=std::system(wc.c_str());
+        if(wr==0){
           std::ifstream in(base+".txt"); std::string line, all;
           while(std::getline(in,line)){ if(!all.empty()) all+=" "; all+=line; }
           while(!all.empty() && std::isspace((unsigned char)all.front())) all.erase(all.begin());
           while(!all.empty() && std::isspace((unsigned char)all.back())) all.pop_back();
-
-          // whisper.cpp emits these for silence; they are not useful transcript.
           std::string lowered=all;
           for(char& ch:lowered) ch=(char)std::tolower((unsigned char)ch);
           bool blank=lowered.empty() || lowered=="[blank_audio]" || lowered=="[blank audio]" ||
                      lowered=="[silence]" || lowered=="(silence)" || lowered=="[music]";
-
           if(!blank){
             std::lock_guard<std::mutex> l(self->mu);
             if(self->transcript.empty() || self->transcript.back()!=all){
@@ -116,11 +125,12 @@ public:
               std::cout<<"STT "<<self->getId()<<": "<<all<<"\\n";
             }
           }
+        } else {
+          std::cerr<<"STT whisper failed for call "<<self->getId()<<" (exit "<<wr<<")\\n";
         }
         std::remove(snap.c_str());
         std::remove(chunk.c_str());
         std::remove((base+".txt").c_str());
-        processed+=2;
       }
       self->transcribing=false;
     }).detach();
