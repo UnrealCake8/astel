@@ -36,6 +36,7 @@ static std::string shellQuote(const std::string& s){
 class AstelCall: public Call {
 public:
   std::string state="CALLING";
+  bool mediaReady=false;
   std::mutex mu;
   std::unique_ptr<AudioMediaPlayer> player;
   AstelCall(Account& a,int id=PJSUA_INVALID_ID):Call(a,id){}
@@ -43,10 +44,29 @@ public:
     auto ci=getInfo(); std::lock_guard<std::mutex> l(mu); state=ci.stateText;
     std::cout<<"Call "<<ci.id<<" -> "<<state<<" ("<<ci.lastStatusCode<<")\n";
   }
+  void onCallMediaState(OnCallMediaStateParam&) override {
+    try {
+      auto ci=getInfo();
+      bool ready=false;
+      for(const auto& m:ci.media){
+        if(m.type==PJMEDIA_TYPE_AUDIO && m.status==PJSUA_CALL_MEDIA_ACTIVE){ ready=true; break; }
+      }
+      { std::lock_guard<std::mutex> l(mu); mediaReady=ready; }
+      std::cout<<"Call "<<ci.id<<" audio media -> "<<(ready?"ACTIVE":"not active")<<"\n";
+    } catch(Error& e){ std::cerr<<"Media state error: "<<e.info()<<"\n"; }
+  }
   std::string getState(){ std::lock_guard<std::mutex> l(mu); return state; }
+  bool isMediaReady(){ std::lock_guard<std::mutex> l(mu); return mediaReady; }
   void speak(const std::string& text){
     auto ci=getInfo();
-    if(ci.state!=PJSIP_INV_STATE_CONFIRMED) throw std::runtime_error("call is not connected");
+    // Some PSTN legs can provide usable audio while SIP is still in an
+    // early-dialog state (for example 183 Session Progress). What matters
+    // for TTS injection is that an audio media stream exists and is active.
+    bool audioActive=false;
+    for(const auto& m:ci.media){
+      if(m.type==PJMEDIA_TYPE_AUDIO && m.status==PJSUA_CALL_MEDIA_ACTIVE){ audioActive=true; break; }
+    }
+    if(!audioActive) throw std::runtime_error("call audio is not ready yet");
     std::string wav="/tmp/astel-"+std::to_string(ci.id)+".wav";
     std::string cmd="/home/ubuntu/astel-piper/bin/python3 -m piper -m /home/ubuntu/astel-voices/en_US-lessac-medium.onnx -f "+shellQuote(wav)+" -- "+shellQuote(text);
     if(std::system(cmd.c_str())!=0) throw std::runtime_error("Piper synthesis failed");
@@ -98,7 +118,7 @@ static void handle(int fd){
       std::shared_ptr<AstelCall> c; {std::lock_guard<std::mutex> l(callsMu);auto it=calls.find(id);if(it!=calls.end())c=it->second;}
       if(!c){reply(fd,404,"{\"error\":\"call not found\"}");}
       else if(method=="GET" && rest==id){
-        reply(fd,200,"{\"callId\":\""+id+"\",\"state\":\""+jsonStr(c->getState())+"\",\"transcript\":[]}");
+        reply(fd,200,"{\"callId\":\""+id+"\",\"state\":\""+jsonStr(c->getState())+"\",\"mediaReady\":"+(c->isMediaReady()?"true":"false")+",\"transcript\":[]}");
       } else if(method=="DELETE" && rest==id){
         CallOpParam p; c->hangup(p); reply(fd,200,"{\"ok\":true}");
       } else if(method=="POST" && rest==id+"/dtmf"){
