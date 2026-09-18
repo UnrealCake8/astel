@@ -2,6 +2,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
+#include <chrono>
+#include <vector>
+#include <cctype>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -13,6 +17,8 @@
 #include <sys/socket.h>
 
 using namespace pj;
+
+static Endpoint ep;
 
 static std::string env(const char* k){ const char* v=std::getenv(k); return v?v:""; }
 static std::string jsonStr(const std::string&s){ std::string o; for(char c:s){ if(c=='"'||c=='\\')o+='\\'; if(c=='\n'){o+="\\n";continue;} o+=c;} return o; }
@@ -39,6 +45,11 @@ public:
   bool mediaReady=false;
   std::mutex mu;
   std::unique_ptr<AudioMediaPlayer> player;
+  std::unique_ptr<AudioMediaRecorder> recorder;
+  std::string recordPath;
+  std::vector<std::string> transcript;
+  std::atomic<bool> transcribing{false};
+  std::atomic<bool> stopTranscription{false};
   AstelCall(Account& a,int id=PJSUA_INVALID_ID):Call(a,id){}
   void onCallState(OnCallStateParam&) override {
     auto ci=getInfo(); std::lock_guard<std::mutex> l(mu); state=ci.stateText;
@@ -53,6 +64,13 @@ public:
       }
       { std::lock_guard<std::mutex> l(mu); mediaReady=ready; }
       std::cout<<"Call "<<ci.id<<" audio media -> "<<(ready?"ACTIVE":"not active")<<"\n";
+      if(ready && !recorder){
+        recordPath="/tmp/astel-in-"+std::to_string(ci.id)+".wav";
+        recorder=std::make_unique<AudioMediaRecorder>();
+        recorder->createRecorder(recordPath);
+        getAudioMedia(-1).startTransmit(*recorder);
+        startTranscriber();
+      }
     } catch(Error& e){ std::cerr<<"Media state error: "<<e.info()<<"\n"; }
   }
   void startTranscriber(){
@@ -121,7 +139,6 @@ public:
   }
 };
 
-static Endpoint ep;
 static AstelAccount account;
 static std::mutex callsMu;
 static std::unordered_map<std::string,std::shared_ptr<AstelCall>> calls;
@@ -153,9 +170,9 @@ static void handle(int fd){
       std::shared_ptr<AstelCall> c; {std::lock_guard<std::mutex> l(callsMu);auto it=calls.find(id);if(it!=calls.end())c=it->second;}
       if(!c){reply(fd,404,"{\"error\":\"call not found\"}");}
       else if(method=="GET" && rest==id){
-        reply(fd,200,"{\"callId\":\""+id+"\",\"state\":\""+jsonStr(c->getState())+"\",\"mediaReady\":"+(c->isMediaReady()?"true":"false")+",\"transcript\":[]}");
+        reply(fd,200,"{\"callId\":\""+id+"\",\"state\":\""+jsonStr(c->getState())+"\",\"mediaReady\":"+(c->isMediaReady()?"true":"false")+",\"transcript\":"+c->getTranscriptJson()+"}");
       } else if(method=="DELETE" && rest==id){
-        CallOpParam p; c->hangup(p); reply(fd,200,"{\"ok\":true}");
+        c->stopTranscription=true; CallOpParam p; c->hangup(p); reply(fd,200,"{\"ok\":true}");
       } else if(method=="POST" && rest==id+"/dtmf"){
         std::string digits=field(body,"digits"); CallSendDtmfParam p; p.digits=digits; c->sendDtmf(p); reply(fd,200,"{\"ok\":true}");
       } else if(method=="POST" && rest==id+"/speak"){
