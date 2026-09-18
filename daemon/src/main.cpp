@@ -52,6 +52,10 @@ static std::unordered_map<std::string,std::shared_ptr<AstelCall>> calls;
 static std::atomic<unsigned long> seq{1};
 
 static void handle(int fd){
+  // HTTP connections are handled on std::threads, which are external to PJLIB.
+  // Register each worker before it invokes any PJSUA2/PJLIB API.
+  try { ep.libRegisterThread("astel-http"); }
+  catch (Error& e) { std::cerr<<"PJLIB thread registration failed: "<<e.info()<<"\\n"; close(fd); return; }
   char buf[16384]; int n=recv(fd,buf,sizeof(buf)-1,0); if(n<=0){close(fd);return;} buf[n]=0;
   std::string req(buf,n), method, path; auto sp=req.find(' '), sp2=req.find(' ',sp+1);
   if(sp==std::string::npos||sp2==std::string::npos){reply(fd,400,"{\"error\":\"bad request\"}");close(fd);return;}
