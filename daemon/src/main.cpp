@@ -79,8 +79,10 @@ public:
     std::thread([self]{
       try { ep.libRegisterThread("astel-stt"); } catch(...) {}
       unsigned long chunkNo=0;
+      // Low-latency mode: shorter overlapping windows reduce the time between
+      // the remote party speaking and text becoming available to the UI.
       while(!self->stopTranscription.load()){
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
         std::string src; { std::lock_guard<std::mutex> l(self->mu); src=self->recordPath; }
         if(src.empty()) continue;
 
@@ -89,8 +91,8 @@ public:
 
         // PJSIP's recorder WAV is intentionally unfinished while the call is
         // active. ffmpeg can recover the live PCM stream and write a normal,
-        // finalized WAV for Whisper. Keep only the newest four seconds.
-        std::string ff="ffmpeg -loglevel error -y -sseof -4 -i "+shellQuote(src)+
+        // finalized WAV for Whisper. Keep only the newest 2.5 seconds.
+        std::string ff="ffmpeg -loglevel error -y -sseof -2.5 -i "+shellQuote(src)+
                        " -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
         if(std::system(ff.c_str())!=0){
           std::cerr<<"STT ffmpeg failed for call "<<self->getId()<<"\\n";
@@ -98,7 +100,7 @@ public:
           continue;
         }
 
-        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -otxt -of "+shellQuote(base)+" >/dev/null 2>&1";
+        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps --threads 2 -bs 1 -bo 1 -otxt -of "+shellQuote(base)+" >/dev/null 2>&1";
         int wr=std::system(wc.c_str());
         if(wr==0){
           std::ifstream in(base+".txt"); std::string line, all;
