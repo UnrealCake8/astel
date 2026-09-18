@@ -55,6 +55,41 @@ public:
       std::cout<<"Call "<<ci.id<<" audio media -> "<<(ready?"ACTIVE":"not active")<<"\n";
     } catch(Error& e){ std::cerr<<"Media state error: "<<e.info()<<"\n"; }
   }
+  void startTranscriber(){
+    if(transcribing.exchange(true)) return;
+    auto self=this;
+    std::thread([self]{
+      try { ep.libRegisterThread("astel-stt"); } catch(...) {}
+      size_t processed=0;
+      while(!self->stopTranscription.load()){
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        std::string src; { std::lock_guard<std::mutex> l(self->mu); src=self->recordPath; }
+        if(src.empty()) continue;
+        std::string chunk="/tmp/astel-whisper-"+std::to_string(self->getId())+".wav";
+        std::string out="/tmp/astel-whisper-"+std::to_string(self->getId());
+        std::string ff="ffmpeg -loglevel error -y -i "+shellQuote(src)+" -ss "+std::to_string(processed)+" -t 5 -ar 16000 -ac 1 -c:a pcm_s16le "+shellQuote(chunk);
+        if(std::system(ff.c_str())!=0) continue;
+        std::string wc="/home/ubuntu/whisper.cpp/build/bin/whisper-cli -m /home/ubuntu/whisper.cpp/models/ggml-tiny.en.bin -f "+shellQuote(chunk)+" -l en --no-timestamps -otxt -of "+shellQuote(out)+" --prompt "+shellQuote("Asanib phone call. Astel is the internal codename.")+" >/dev/null 2>&1";
+        if(std::system(wc.c_str())==0){
+          std::ifstream in(out+".txt"); std::string line, all;
+          while(std::getline(in,line)){ if(!all.empty()) all+=" "; all+=line; }
+          while(!all.empty() && std::isspace((unsigned char)all.front())) all.erase(all.begin());
+          while(!all.empty() && std::isspace((unsigned char)all.back())) all.pop_back();
+          if(!all.empty()){
+            std::lock_guard<std::mutex> l(self->mu);
+            if(self->transcript.empty() || self->transcript.back()!=all) self->transcript.push_back(all);
+          }
+        }
+        processed+=4;
+      }
+      self->transcribing=false;
+    }).detach();
+  }
+  std::string getTranscriptJson(){
+    std::lock_guard<std::mutex> l(mu); std::string j="[";
+    for(size_t i=0;i<transcript.size();++i){ if(i) j+=","; j+="{\\\"speaker\\\":\\\"remote\\\",\\\"text\\\":\\\""+jsonStr(transcript[i])+"\\\"}"; }
+    return j+"]";
+  }
   std::string getState(){ std::lock_guard<std::mutex> l(mu); return state; }
   bool isMediaReady(){ std::lock_guard<std::mutex> l(mu); return mediaReady; }
   void speak(const std::string& text){
